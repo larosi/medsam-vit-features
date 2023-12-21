@@ -59,49 +59,28 @@ def get_dense_descriptor(model, img):
 
 
 dataset_path = r'D:\datasets\medseg\medicaldecathlon\Task08_HepaticVessel\Task08_HepaticVessel\imagesTr'
-dataset_label_path = r'D:\datasets\medseg\medicaldecathlon\Task08_HepaticVessel\Task08_HepaticVessel\labelsTr'
 
-features_dir = r'..\data\features'
-ct_fn = 'hepaticvessel_001.nii.gz'
-
-ct_data, spatial_res = load_ct(dataset_path, ct_fn)
-ct_labels, spatial_res = load_ct(dataset_label_path, ct_fn)
-
-target_tissues = ct_data[ct_labels > 0]
-
-target_min = target_tissues.min()
-target_max = target_tissues.max()
-target_std = target_tissues.std()
-target_mean = target_tissues.mean()
-
-print('Vessels HU ranges')
-print(f'mean {target_mean}')
-print(f'std {target_std}')
-print(f'min-max {target_min} {target_max}')
-
-lower_bound = -100
-upper_bound = 400
-ct_data = np.clip(ct_data, lower_bound, upper_bound)
-#https://radiopaedia.org/articles/windowing-ct
-ct_data = min_max_scale(ct_data)
-
-"""
-for slice_i in tqdm(range(0, ct_data.shape[2])):
-    im_labels = ct_data[:, :, slice_i]
-    
-    io.imshow(im_labels)
-    io.show()
-"""
 model = load_model()
-all_features = []
+lower_bound = -160
+upper_bound = 240
+#https://radiopaedia.org/articles/windowing-ct
 
-for slice_i in tqdm(range(0, ct_data.shape[2])):
-    img = ct_data[:, :, slice_i]
-    features = get_dense_descriptor(model, img)
-    all_features.append(features)
+for ct_fn in tqdm(os.listdir(dataset_path)):
+    features_dir = r'..\data\features\Task08_HepaticVessel'
+    features_fn = ct_fn.split('.')[0] + '.npy'
+    features_path = os.path.join(features_dir, features_fn)
+    if not os.path.exists(features_path):
+        ct_data, spatial_res = load_ct(dataset_path, ct_fn)
 
-all_features = np.array(all_features)
+        ct_data = np.clip(ct_data, lower_bound, upper_bound)
+        ct_data = min_max_scale(ct_data)
 
-features_fn = ct_fn.split('.')[0] + '.npy'
-features_path = os.path.join(features_dir, features_fn)
-np.save(features_path, all_features)
+        all_features = []
+
+        for slice_i in tqdm(range(0, ct_data.shape[2])):
+            img = ct_data[:, :, slice_i]
+            features = get_dense_descriptor(model, img)
+            all_features.append(features)
+
+        all_features = np.array(all_features)
+        np.save(features_path, all_features)
