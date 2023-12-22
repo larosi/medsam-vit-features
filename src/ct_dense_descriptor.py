@@ -8,13 +8,14 @@ Created on Fri Nov 24 14:38:14 2023
 
 import os
 import numpy as np
-from skimage import io
+
 from skimage.transform import resize
 from skimage.color import gray2rgb
 import torch
 import nibabel as nib
 from segment_anything import sam_model_registry
 from tqdm import tqdm
+import concurrent.futures
 
 
 def prepare_image(img):
@@ -34,12 +35,10 @@ def load_model():
     return model
 
 def load_ct(dataset_path, ct_fn):
-    
     ct_path = os.path.join(dataset_path, ct_fn)
     img = nib.load(ct_path)
     data = img.get_fdata()
     spatial_res = img.header.get_zooms()
-    
     return data, spatial_res
 
 def min_max_scale(data):
@@ -57,6 +56,8 @@ def get_dense_descriptor(model, img):
     features = np.squeeze(features)
     return features
 
+def save_features_async(filename, data):
+    np.savez_compressed(filename, data)
 
 dataset_path = r'D:\datasets\medseg\medicaldecathlon\Task08_HepaticVessel\Task08_HepaticVessel\imagesTr'
 
@@ -67,7 +68,7 @@ upper_bound = 240
 
 for ct_fn in tqdm(os.listdir(dataset_path)):
     features_dir = r'..\data\features\Task08_HepaticVessel'
-    features_fn = ct_fn.split('.')[0] + '.npy'
+    features_fn = ct_fn.split('.')[0] + '.npz'
     features_path = os.path.join(features_dir, features_fn)
     if not os.path.exists(features_path):
         ct_data, spatial_res = load_ct(dataset_path, ct_fn)
@@ -77,10 +78,12 @@ for ct_fn in tqdm(os.listdir(dataset_path)):
 
         all_features = []
 
-        for slice_i in tqdm(range(0, ct_data.shape[2])):
+        for slice_i in tqdm(range(0, ct_data.shape[2]), desc=ct_fn):
             img = ct_data[:, :, slice_i]
             features = get_dense_descriptor(model, img)
             all_features.append(features)
 
-        all_features = np.array(all_features)
-        np.save(features_path, all_features)
+        features_to_save = np.array(all_features)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(save_features_async, features_path, features_to_save)
