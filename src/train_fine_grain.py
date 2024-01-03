@@ -194,76 +194,77 @@ if __name__ == '__main__':
 
     ct_filenames = os.listdir(labels_dir)
     for epoch in tqdm(range(num_epochs), position=0, desc='epoch'):
+        with tqdm(total=len(ct_filenames), desc='batch', position=1) as batch_pbar:
+            for ct_fn in ct_filenames:
+                features_fn = ct_fn.split('.')[0] + '.npz'
+                features_path = os.path.join(features_dir, features_fn)
+                labels_path = os.path.join(labels_dir, ct_fn)
 
-        for ct_fn in tqdm(ct_filenames, position=1, desc='batch', leave=False):
-            features_fn = ct_fn.split('.')[0] + '.npz'
-            features_path = os.path.join(features_dir, features_fn)
-            labels_path = os.path.join(labels_dir, ct_fn)
+                all_features = load_features(features_path)
 
-            all_features = load_features(features_path)
+                ct_labels, spatial_res = load_ct(labels_dir, ct_fn)
+                df = create_dataframe(ct_labels, spatial_res, all_features, division_factor=8)
+                all_features = all_features.reshape(-1, all_features.shape[-1]).astype(np.float32)
 
-            ct_labels, spatial_res = load_ct(labels_dir, ct_fn)
-            df = create_dataframe(ct_labels, spatial_res, all_features, division_factor=8)
-            all_features = all_features.reshape(-1, all_features.shape[-1]).astype(np.float32)
+                foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
+                foreground_mean = foreground_stats.loc['mean'].values
+                foreground_std = foreground_stats.loc['std'].values
 
-            foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
-            foreground_mean = foreground_stats.loc['mean'].values
-            foreground_std = foreground_stats.loc['std'].values
+                df_sample = df.groupby(['label'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000)))
+                # df_sample.to_csv(r'..\data\ct_sample.txt', sep=' ', index=False)
+                df_train, df_test, _, _ = train_test_split(df_sample, df_sample['label'],
+                                                           stratify=df_sample['label'],
+                                                           random_state=42, train_size=0.7)
+                df_train.sort_values(by='block_id', inplace=True)
+                df_test.sort_values(by='block_id', inplace=True)
 
-            df_sample = df.groupby(['label'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000)))
-            # df_sample.to_csv(r'..\data\ct_sample.txt', sep=' ', index=False)
-            df_train, df_test, _, _ = train_test_split(df_sample, df_sample['label'],
-                                                       stratify=df_sample['label'],
-                                                       random_state=42, train_size=0.7)
-            df_train.sort_values(by='block_id', inplace=True)
-            df_test.sort_values(by='block_id', inplace=True)
+                train_batch_size = int(np.ceil(len(df_train) / (len(df_train) // num_points)))
+                test_batch_size = int(np.ceil(len(df_test) / (len(df_test) // num_points)))
 
-            train_batch_size = int(np.ceil(len(df_train) / (len(df_train) // num_points)))
-            test_batch_size = int(np.ceil(len(df_test) / (len(df_test) // num_points)))
+                train_dataset = CT3DDataset(df_train, all_features, label_encoder,
+                                            foreground_mean, foreground_std, train_batch_size)
+                test_dataset = CT3DDataset(df_test, all_features, label_encoder,
+                                           foreground_mean, foreground_std, test_batch_size)
 
-            train_dataset = CT3DDataset(df_train, all_features, label_encoder,
-                                        foreground_mean, foreground_std, train_batch_size)
-            test_dataset = CT3DDataset(df_test, all_features, label_encoder,
-                                       foreground_mean, foreground_std, test_batch_size)
+                train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+                test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+                total_train_loss = 0
+                total_test_loss = 0
 
-            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
-            test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-            total_train_loss = 0
-            total_test_loss = 0
+                # train loop
+                model.train()
+                for features_batch, labels_batch in train_loader:
+                    features_batch = features_batch.to(device)
+                    labels_batch = torch.squeeze(labels_batch).to(device)
+                    optimizer.zero_grad()
+                    outputs = model(features_batch)
+                    loss = criterion(outputs, labels_batch)
+                    loss.backward()
+                    optimizer.step()
+                    total_train_loss += loss.item()
 
-            # train loop
-            model.train()
-            for features_batch, labels_batch in train_loader:
-                features_batch = features_batch.to(device)
-                labels_batch = torch.squeeze(labels_batch).to(device)
-                optimizer.zero_grad()
-                outputs = model(features_batch)
-                loss = criterion(outputs, labels_batch)
-                loss.backward()
-                optimizer.step()
-                total_train_loss += loss.item()
+                # test loop
+                for features_batch, labels_batch in test_loader:
+                    features_batch = features_batch.to(device)
+                    labels_batch = torch.squeeze(labels_batch).to(device)
+                    outputs = model(features_batch)
+                    loss = criterion(outputs, labels_batch)
+                    total_test_loss += loss.item()
 
-            # test loop
-            for features_batch, labels_batch in test_loader:
-                features_batch = features_batch.to(device)
-                labels_batch = torch.squeeze(labels_batch).to(device)
-                outputs = model(features_batch)
-                loss = criterion(outputs, labels_batch)
-                total_test_loss += loss.item()
+                avg_train_loss = total_train_loss / len(train_loader)
+                avg_test_loss = total_test_loss / len(test_loader)
 
-            avg_train_loss = total_train_loss / len(train_loader)
-            avg_test_loss = total_test_loss / len(test_loader)
+                batch_pbar.set_postfix({'Train Loss': avg_train_loss, 'Test Loss': avg_test_loss})
+                batch_pbar.update()
 
-            train_metrics['epoch'].append(epoch)
-            train_metrics['train_loss'].append(avg_train_loss)
-            train_metrics['test_loss'].append(avg_test_loss)
-            train_metrics['ct'].append(ct_fn)
+                train_metrics['epoch'].append(epoch)
+                train_metrics['train_loss'].append(avg_train_loss)
+                train_metrics['test_loss'].append(avg_test_loss)
+                train_metrics['ct'].append(ct_fn)
 
-        print(f'\nEpoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Test Loss: {avg_test_loss:.4f}')
-        model.save_checkpoint(save_dir, epoch)
-
-# Save train and test loss metrics
-df_loss = pd.DataFrame(train_metrics)
-df_loss.to_csv(os.path.join(save_dir, 'losses.csv'), index=False)
-fig = plot_loss_metrics(df_loss)
-fig.write_html(os.path.join(save_dir, 'losses.html'))
+            # Save train and test loss metrics
+            model.save_checkpoint(save_dir, epoch)
+            df_loss = pd.DataFrame(train_metrics)
+            fig = plot_loss_metrics(df_loss)
+            fig.write_html(os.path.join(save_dir, 'losses.html'))
+            df_loss.to_csv(os.path.join(save_dir, 'losses.csv'), index=False)
