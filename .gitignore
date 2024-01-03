@@ -1,2 +1,5 @@
 # ignore everything in the following folders
 data/*
+data/bak/*
+models/*
+metrics/*
