@@ -13,6 +13,7 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
 import plotly.graph_objs as go
+from joblib import load
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,17 @@ class SimpleTransformer(nn.Module):
         super(SimpleTransformer, self).__init__()
         self.encoder_layer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads)
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
+        """
+        self.output_upscaling = nn.Sequential(
+            nn.ConvTranspose3d(input_dim, input_dim // 4,
+                               kernel_size=(3, 3, 3), stride=(1, 1, 1)),
+            nn.InstanceNorm3d(input_dim // 4),
+            nn.GELU(),
+            nn.ConvTranspose3d(input_dim // 4, num_classes,
+                               kernel_size=(3, 3, 3), stride=(1, 1, 1)),
+            nn.GELU(),
+        )
+        """
         self.classifier = nn.Linear(input_dim, num_classes)
 
     def forward(self, x):
@@ -40,6 +52,11 @@ class SimpleTransformer(nn.Module):
         epoch_str = str(epoch).zfill(4)
         model_path = os.path.join(save_dir, f'model_epoch_{epoch_str}.pth')
         self.save(model_path)
+    
+    def load_checkpoint(self, save_dir, epoch):
+        epoch_str = str(epoch).zfill(4)
+        model_path = os.path.join(save_dir, f'model_epoch_{epoch_str}.pth')
+        self.load(model_path)
 
     def save(self, model_path):
         torch.save(self.state_dict(), model_path)
@@ -49,13 +66,33 @@ class SimpleTransformer(nn.Module):
         self.load_state_dict(torch.load(model_path, map_location=device))
 
 
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, y_pred, y_true):
+        assert y_pred.size() == y_true.size()
+        y_pred = F.softmax(y_pred, dim=1)
+        total_loss = 0.0
+
+        for class_index in range(y_true.size(1)):
+
+            y_pred_class = y_pred[:, class_index, ...].contiguous().view(-1)
+            y_true_class = y_true[:, class_index, ...].contiguous().view(-1)
+            intersection = (y_pred_class * y_true_class).sum()
+            dice_coefficient = (2. * intersection + self.smooth) / (y_pred_class.sum() + y_true_class.sum() + self.smooth)
+            total_loss += (1 - dice_coefficient)
+        dice = total_loss / y_true.size(1)
+        return dice
+
 class CT3DDataset(Dataset):
-    def __init__(self, dataframe, all_features, label_encoder, foreground_mean, foreground_std, batch_size):
+    def __init__(self, dataframe, all_features, label_encoder, batch_size):
         self.dataframe = dataframe
         self.all_features = all_features
         self.label_encoder = label_encoder
-        self.foreground_mean = foreground_mean
-        self.foreground_std = foreground_std
+        #self.foreground_mean = foreground_mean
+        #self.foreground_std = foreground_std
         self.batch_size = batch_size
 
     def __len__(self):
@@ -67,16 +104,42 @@ class CT3DDataset(Dataset):
         df_batch = self.dataframe.iloc[start:end]
         patch_id = df_batch['patch_id'].values
         xyz = df_batch[['x', 'y', 'z']].values
-        xyz = (xyz - self.foreground_mean) / (2.5 * self.foreground_std[1])
-        pe = positional_encoding_3d(x=xyz[:,0], y=xyz[:,1], z=xyz[:,2], D=256, scale=10)
+        #xyz = (xyz - self.foreground_mean) / (2.5 * self.foreground_std[1])
+        #xyz = xyz / (2.5 * self.foreground_std[1])
+        #pe = positional_encoding_3d(x=xyz[:,0], y=xyz[:,1], z=xyz[:,2], D=64, scale=0.02)
+        pe = nerf_positional_encoding(xyz, D=64, interpolate=False)
         positional_norm = np.linalg.norm(pe) / 2
-        features = self.all_features[patch_id] + pe / positional_norm
-        
+        features = self.all_features[patch_id] 
+        extra_features = np.expand_dims(df_batch['raw'].values, axis=-1)
+        features = np.concatenate([features, extra_features], axis=-1) + pe / positional_norm
+
         label = df_batch['label'].values
         label = np.expand_dims(label, axis=-1)
         label = self.label_encoder.transform(label).toarray()
 
         return torch.as_tensor(features, dtype=torch.float32), torch.as_tensor(label, dtype=torch.float32)
+
+def nerf_positional_encoding(xyz, D=64, interpolate=True):
+    num_encoding_functions = int(np.ceil(D /6))
+    encoding = []
+    frequency_bands = 2.0 ** np.linspace(0.0,
+                                         num_encoding_functions - 1,
+                                         num_encoding_functions)
+    for freq in frequency_bands:
+        for func in [np.sin, np.cos]:
+            encoding.append(func(xyz * freq))
+    encoding = np.concatenate(encoding, axis=-1)
+    npoints, dim = encoding.shape
+    norm = np.expand_dims(np.linalg.norm(encoding, axis=-1), axis=-1)
+    encoding = encoding / norm
+    if dim != D:
+        if interpolate:
+            encoding = zoom(encoding, (1, D/dim), order=3)
+            norm = np.expand_dims(np.linalg.norm(encoding, axis=-1), axis=-1)
+            encoding = encoding / norm
+        else:
+            encoding = encoding[:,:D]
+    return encoding
 
 def positional_encoding_3d(x, y, z, D, scale=10):
     x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
@@ -94,13 +157,19 @@ def positional_encoding_3d(x, y, z, D, scale=10):
     return encoding
 
 
-def load_features(features_path):
+def load_features(features_path, pca=None):
     with np.load(features_path) as data:
         all_features = np.load(features_path)['arr_0']
     all_features = np.transpose(all_features, (2, 3, 0, 1))
+    if pca:
+        x, y, z, d = all_features.shape
+        all_features = all_features.reshape(-1, all_features.shape[-1]).astype(np.float32)
+        all_features = pca.transform(all_features)
+        all_features = all_features.reshape((x, y, z, -1))
+
     return all_features
 
-def create_dataframe(ct_labels, spatial_res, all_features, division_factor=8):
+def create_dataframe(ct_labels, ct_data, spatial_res, all_features, division_factor=8):
     x, y, z = np.meshgrid(np.arange(0, ct_labels.shape[0]),
                           np.arange(0, ct_labels.shape[1]),
                           np.arange(0, ct_labels.shape[2]))
@@ -114,15 +183,28 @@ def create_dataframe(ct_labels, spatial_res, all_features, division_factor=8):
     all_features_ids = np.expand_dims(all_features_ids, axis=-1)
     all_features_ids = all_features_ids.reshape(all_features.shape[:-1])
     all_features_ids = zoom(all_features_ids, (8, 8, 1), order=0)
+    
+    # edges for sampling
+    dx, dy, dz = np.gradient(ct_data)
+    ct_edges = np.sqrt(dx**2 + dy**2 + dz**2)
+    edges_th = np.percentile(ct_edges[ct_edges > 0], 50)
+    ct_edges = ct_edges > edges_th
+    
+    dx, dy, dz = np.gradient(ct_labels)
+    label_edges = np.sqrt(dx**2 + dy**2 + dz**2) > 0
 
     # save metrics coordinates, ids and labels into a dataframe
     df = pd.DataFrame()
     df['x'] = x.flatten() * spatial_res[0]
     df['y'] = y.flatten() * spatial_res[1]
     df['z'] = z.flatten() * spatial_res[2]
+    df['raw'] = ct_data.flatten()
+    df['edges'] = ct_edges.flatten()
+    df['label_edges'] = label_edges.flatten()
     df['label'] = ct_labels.flatten().astype(int)
     df['patch_id'] = all_features_ids.flatten().astype(int)
     df['block_id'] = block_ids.flatten().astype(int)
+
     return df
 
 
@@ -169,62 +251,105 @@ def plot_loss_metrics(df_loss):
     )
     return fig
 
+def min_max_scale(data):
+    return (data - data.min()) / (data.max() - data.min())
+
+def normalize_coordinates_(df):
+    foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
+    foreground_mean = foreground_stats.loc['mean'].values
+    foreground_std = foreground_stats.loc['std'].values
+
+    df[['x', 'y', 'z']] = (df[['x', 'y', 'z']] - foreground_mean) / (2.5 * foreground_std[1])
+    xyz_min = df[['x', 'y', 'z']].min(axis=0).values
+    
+    df[['x', 'y', 'z']] = df[['x', 'y', 'z']] - xyz_min
+
+    return df
+
+def normalize_coordinates(df, pos_bins=1024):
+    foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
+    foreground_mean = foreground_stats.loc['mean'].values
+    foreground_std = foreground_stats.loc['std'].values
+    df[['x', 'y', 'z']] = (df[['x', 'y', 'z']] / (6*foreground_std[1])) * pos_bins
+    df[['x', 'y', 'z']] = df[['x', 'y', 'z']].round(0).astype(int)
+    return df
 
 if __name__ == '__main__':
+    dataset_dir = r'D:\datasets\medseg\medicaldecathlon\Task08_HepaticVessel\Task08_HepaticVessel\imagesTr'
     features_dir = r'..\data\features\Task08_HepaticVessel'
     labels_dir = r'..\data\labels\Task08_HepaticVessel'
     save_dir = os.path.join('..', 'models', 'medsam_fine_grain_3d')
 
-    labelmap = get_labelmap()
+    labelmap, labelmap_inv = get_labelmap()
     label_encoder = OneHotEncoder(handle_unknown='ignore')
     label_encoder.fit(np.array(list(labelmap.keys())).reshape(-1, 1))
+    num_points = 64*64*8
+    start_epoch = 0
+    num_epochs = 10
+    lower_bound = -160
+    upper_bound = 240
 
     device = torch.cuda.current_device()
-    model = SimpleTransformer(input_dim=256, num_heads=4, num_classes=len(labelmap))
+    model = SimpleTransformer(input_dim=64, num_heads=8, num_classes=len(labelmap))
+    if start_epoch != 0:
+        model.load_checkpoint(save_dir, start_epoch)
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+
+    pca = load(r'..\models\pca\pca_63.joblib')
+    criterion = DiceLoss()
+    #criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    num_points = 64*64
-    num_epochs = 10
 
     train_metrics = {'epoch': [],
                      'train_loss': [],
                      'test_loss': [],
                      'ct': []}
+    if start_epoch != 0:
+        df_loss = pd.read_csv(os.path.join(save_dir, 'losses.csv'))
+        for k in train_metrics.keys():
+            train_metrics[k] = df_loss[k].to_list()
 
-    ct_filenames = os.listdir(labels_dir)
-    for epoch in tqdm(range(num_epochs), position=0, desc='epoch'):
+    df_files = pd.DataFrame()
+    df_files['ct'] = os.listdir(labels_dir)
+    df_files['split'] = 'train'
+    df_files.loc[df_files.sample(frac=0.1, random_state=42).index, 'split'] = 'test'
+    ct_filenames = df_files[df_files['split'] == 'train']['ct'].to_list()
+
+    for epoch in tqdm(range(start_epoch, start_epoch+num_epochs), position=0, desc='epoch'):
         with tqdm(total=len(ct_filenames), desc='batch', position=1) as batch_pbar:
             for ct_fn in ct_filenames:
                 features_fn = ct_fn.split('.')[0] + '.npz'
                 features_path = os.path.join(features_dir, features_fn)
                 labels_path = os.path.join(labels_dir, ct_fn)
 
-                all_features = load_features(features_path)
+                all_features = load_features(features_path, pca)
 
+                ct_data, spatial_res = load_ct(dataset_dir, ct_fn)
+                ct_data = np.clip(ct_data, lower_bound, upper_bound)
+                ct_data = min_max_scale(ct_data)
+                
                 ct_labels, spatial_res = load_ct(labels_dir, ct_fn)
-                df = create_dataframe(ct_labels, spatial_res, all_features, division_factor=8)
+                df = create_dataframe(ct_labels, ct_data, spatial_res, all_features, division_factor=8)
+                df = normalize_coordinates(df)
                 all_features = all_features.reshape(-1, all_features.shape[-1]).astype(np.float32)
 
-                foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
-                foreground_mean = foreground_stats.loc['mean'].values
-                foreground_std = foreground_stats.loc['std'].values
-
-                df_sample = df.groupby(['label'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000)))
+                #df_sample = df.groupby(['label'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000), random_state=42))
+                df_sample = df.groupby(['label', 'edges', 'label_edges'], group_keys=False).apply(lambda x: x.sample(min(len(x), 65000), random_state=42))
                 # df_sample.to_csv(r'..\data\ct_sample.txt', sep=' ', index=False)
-                df_train, df_test, _, _ = train_test_split(df_sample, df_sample['label'],
+                df_train_all, df_test, _, _ = train_test_split(df_sample, df_sample['label'],
                                                            stratify=df_sample['label'],
                                                            random_state=42, train_size=0.7)
+ 
+                df_train = df_train_all.groupby(['label', 'edges', 'label_edges'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000)))
+
                 df_train.sort_values(by='block_id', inplace=True)
                 df_test.sort_values(by='block_id', inplace=True)
 
                 train_batch_size = int(np.ceil(len(df_train) / (len(df_train) // num_points)))
                 test_batch_size = int(np.ceil(len(df_test) / (len(df_test) // num_points)))
 
-                train_dataset = CT3DDataset(df_train, all_features, label_encoder,
-                                            foreground_mean, foreground_std, train_batch_size)
-                test_dataset = CT3DDataset(df_test, all_features, label_encoder,
-                                           foreground_mean, foreground_std, test_batch_size)
+                train_dataset = CT3DDataset(df_train, all_features, label_encoder, train_batch_size)
+                test_dataset = CT3DDataset(df_test, all_features, label_encoder, test_batch_size)
 
                 train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
                 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
