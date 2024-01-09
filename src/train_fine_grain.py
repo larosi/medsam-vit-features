@@ -107,7 +107,8 @@ class CT3DDataset(Dataset):
         #xyz = (xyz - self.foreground_mean) / (2.5 * self.foreground_std[1])
         #xyz = xyz / (2.5 * self.foreground_std[1])
         #pe = positional_encoding_3d(x=xyz[:,0], y=xyz[:,1], z=xyz[:,2], D=64, scale=0.02)
-        pe = nerf_positional_encoding(xyz, D=64, interpolate=False)
+        #pe = nerf_positional_encoding(xyz, D=64, interpolate=False)
+        pe = positional_encoding_3d_diagonals(x=xyz[:,0], y=xyz[:,1], z=xyz[:,2], D=64, scale=0.02)
         positional_norm = np.linalg.norm(pe) / 2
         features = self.all_features[patch_id] 
         extra_features = np.expand_dims(df_batch['raw'].values, axis=-1)
@@ -156,6 +157,32 @@ def positional_encoding_3d(x, y, z, D, scale=10):
 
     return encoding
 
+def positional_encoding_3d_diagonals(x, y, z, D, scale=0.02):
+    x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
+    n_points = x.shape[0]
+    encoding = np.zeros((n_points, D))
+
+    xy = x+y
+    xz = x+z
+    yz = y+z
+
+    for i in range(D // 12):
+        scale_factor = scale ** (6 * i / D)
+        encoding[:, 2*i] = np.sin(x / scale_factor)
+        encoding[:, 2*i + 1] = np.cos(x / scale_factor)
+        encoding[:, 2*i + D // 6] = np.sin(y / scale_factor)
+        encoding[:, 2*i + 1 + D // 6] = np.cos(y / scale_factor)
+        encoding[:, 2*i + 2 * D // 6] = np.sin(z / scale_factor)
+        encoding[:, 2*i + 1 + 2 * D // 6] = np.cos(z / scale_factor)
+
+        encoding[:, 2*i + 3 * D // 6] = np.sin(xy / scale_factor)
+        encoding[:, 2*i + 1 + 3 * D // 6] = np.cos(xy / scale_factor)
+        encoding[:, 2*i + 4 * D // 6] = np.sin(xz / scale_factor)
+        encoding[:, 2*i + 1 + 4 * D // 6] = np.cos(xz / scale_factor)
+        encoding[:, 2*i + 5 * D // 6] = np.sin(yz / scale_factor)
+        encoding[:, 2*i + 1 + 5 * D // 6] = np.cos(yz / scale_factor)
+
+    return encoding
 
 def load_features(features_path, pca=None):
     with np.load(features_path) as data:
@@ -207,6 +234,16 @@ def create_dataframe(ct_labels, ct_data, spatial_res, all_features, division_fac
 
     return df
 
+def df_to_lowres(df):
+    original_dtypes = df.dtypes
+    df_lowres = df.groupby(['patch_id']).median()
+    df_lowres.reset_index(drop=False, inplace=True)
+    for col, dtype in original_dtypes.items():
+        if 'int' in str(dtype):
+            df_lowres[col] = df_lowres[col].astype(int)
+        if 'bool' in str(dtype):
+            df_lowres[col] = df_lowres[col] > 0
+    return df_lowres
 
 def plot_loss_metrics(df_loss):
     avg_loss_per_epoch = df_loss.groupby('epoch').agg({'train_loss': ['mean', 'std'],
@@ -254,30 +291,21 @@ def plot_loss_metrics(df_loss):
 def min_max_scale(data):
     return (data - data.min()) / (data.max() - data.min())
 
-def normalize_coordinates_(df):
+def normalize_coordinates(df):
     foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
     foreground_mean = foreground_stats.loc['mean'].values
     foreground_std = foreground_stats.loc['std'].values
-
-    df[['x', 'y', 'z']] = (df[['x', 'y', 'z']] - foreground_mean) / (2.5 * foreground_std[1])
-    xyz_min = df[['x', 'y', 'z']].min(axis=0).values
-    
-    df[['x', 'y', 'z']] = df[['x', 'y', 'z']] - xyz_min
-
+    df[['x', 'y', 'z']] = ((df[['x', 'y', 'z']] - foreground_mean)/ (2.5*foreground_std[1]))
+    df['z'] = df['z']*2
     return df
 
-def normalize_coordinates(df, pos_bins=1024):
-    foreground_stats = df[df['label'] > 0][['x', 'y', 'z']].agg(['mean', 'std'])
-    foreground_mean = foreground_stats.loc['mean'].values
-    foreground_std = foreground_stats.loc['std'].values
-    df[['x', 'y', 'z']] = (df[['x', 'y', 'z']] / (6*foreground_std[1])) * pos_bins
-    df[['x', 'y', 'z']] = df[['x', 'y', 'z']].round(0).astype(int)
-    return df
 
 if __name__ == '__main__':
     dataset_dir = r'D:\datasets\medseg\medicaldecathlon\Task08_HepaticVessel\Task08_HepaticVessel\imagesTr'
     features_dir = r'..\data\features\Task08_HepaticVessel'
     labels_dir = r'..\data\labels\Task08_HepaticVessel'
+    lowres_dir = r'..\data\\lowres_dataframes\Task08_HepaticVessel'
+    
     save_dir = os.path.join('..', 'models', 'medsam_fine_grain_3d')
 
     labelmap, labelmap_inv = get_labelmap()
@@ -318,35 +346,45 @@ if __name__ == '__main__':
     for epoch in tqdm(range(start_epoch, start_epoch+num_epochs), position=0, desc='epoch'):
         with tqdm(total=len(ct_filenames), desc='batch', position=1) as batch_pbar:
             for ct_fn in ct_filenames:
-                features_fn = ct_fn.split('.')[0] + '.npz'
+                ct_fn_base = ct_fn.split('.')[0]
+                features_fn = ct_fn_base + '.npz'
                 features_path = os.path.join(features_dir, features_fn)
                 labels_path = os.path.join(labels_dir, ct_fn)
 
                 all_features = load_features(features_path, pca)
 
-                ct_data, spatial_res = load_ct(dataset_dir, ct_fn)
-                ct_data = np.clip(ct_data, lower_bound, upper_bound)
-                ct_data = min_max_scale(ct_data)
-                
-                ct_labels, spatial_res = load_ct(labels_dir, ct_fn)
-                df = create_dataframe(ct_labels, ct_data, spatial_res, all_features, division_factor=8)
-                df = normalize_coordinates(df)
+                df_lowres_path = os.path.join(lowres_dir, f'{ct_fn_base}.parquet')
+                if os.path.exists(df_lowres_path):
+                    df_sample = pd.read_parquet(df_lowres_path)
+                else:
+                    ct_data, spatial_res = load_ct(dataset_dir, ct_fn)
+                    ct_data = np.clip(ct_data, lower_bound, upper_bound)
+                    ct_data = min_max_scale(ct_data)
+                    
+                    ct_labels, spatial_res = load_ct(labels_dir, ct_fn)
+                    df = create_dataframe(ct_labels, ct_data, spatial_res, all_features, division_factor=8)
+                    df = normalize_coordinates(df)
+                    #df_sample = df.groupby(['label'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000), random_state=42))
+                    #df_sample = df.groupby(['label', 'edges', 'label_edges'], group_keys=False).apply(lambda x: x.sample(min(len(x), 65000), random_state=42))
+                    df_sample = df_to_lowres(df)
+                    df_sample.to_parquet(df_lowres_path)
                 all_features = all_features.reshape(-1, all_features.shape[-1]).astype(np.float32)
-
-                #df_sample = df.groupby(['label'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000), random_state=42))
-                df_sample = df.groupby(['label', 'edges', 'label_edges'], group_keys=False).apply(lambda x: x.sample(min(len(x), 65000), random_state=42))
                 # df_sample.to_csv(r'..\data\ct_sample.txt', sep=' ', index=False)
-                df_train_all, df_test, _, _ = train_test_split(df_sample, df_sample['label'],
-                                                           stratify=df_sample['label'],
-                                                           random_state=42, train_size=0.7)
- 
+                
+                if df_sample.groupby('label')['label'].count().min() > 2:
+                    df_train_all, df_test, _, _ = train_test_split(df_sample, df_sample['label'],
+                                                               stratify=df_sample['label'],
+                                                               random_state=42, train_size=0.7)
+                else:
+                    df_train_all, df_test, _, _ = train_test_split(df_sample, df_sample['label'], random_state=42, train_size=0.7)
+                
                 df_train = df_train_all.groupby(['label', 'edges', 'label_edges'], group_keys=False).apply(lambda x: x.sample(min(len(x), 15000)))
 
                 df_train.sort_values(by='block_id', inplace=True)
                 df_test.sort_values(by='block_id', inplace=True)
 
-                train_batch_size = int(np.ceil(len(df_train) / (len(df_train) // num_points)))
-                test_batch_size = int(np.ceil(len(df_test) / (len(df_test) // num_points)))
+                train_batch_size = int(np.ceil(len(df_train) / max((len(df_train) // num_points), 1)))
+                test_batch_size = int(np.ceil(len(df_test) / max((len(df_test) // num_points), 1)))
 
                 train_dataset = CT3DDataset(df_train, all_features, label_encoder, train_batch_size)
                 test_dataset = CT3DDataset(df_test, all_features, label_encoder, test_batch_size)
@@ -393,3 +431,4 @@ if __name__ == '__main__':
             fig = plot_loss_metrics(df_loss)
             fig.write_html(os.path.join(save_dir, 'losses.html'))
             df_loss.to_csv(os.path.join(save_dir, 'losses.csv'), index=False)
+
