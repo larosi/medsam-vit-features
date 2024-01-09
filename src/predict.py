@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from prepare_labels import load_ct, get_labelmap, imshow_labels
-from train_fine_grain import SimpleTransformer, CT3DDataset
+from train_fine_grain import SimpleTransformer, CT3DDataset, df_to_lowres
 from train_fine_grain import load_features, create_dataframe, min_max_scale, normalize_coordinates
 from joblib import load
 
@@ -58,6 +58,8 @@ model.to(device)
 num_points = 64*64*8
 lower_bound = -160
 upper_bound = 240
+
+lowres_prediction = True
 for ct_fn in tqdm(test_files[1:2]):
     features_fn = ct_fn.split('.')[0] + '.npz'
     features_path = os.path.join(features_dir, features_fn)
@@ -72,6 +74,8 @@ for ct_fn in tqdm(test_files[1:2]):
     ct_labels, spatial_res = load_ct(labels_dir, ct_fn)
     df = create_dataframe(ct_labels, ct_data, spatial_res, all_features, division_factor=8)
     df = normalize_coordinates(df)
+    if lowres_prediction:
+        df = df_to_lowres(df)
     all_features = all_features.reshape(-1, all_features.shape[-1]).astype(np.float32)
 
     batch_size = int(np.ceil(len(df) / (len(df) // num_points)))
@@ -89,6 +93,8 @@ for ct_fn in tqdm(test_files[1:2]):
     
     
     h, w, d = ct_data.shape
+    if lowres_prediction:
+        h, w = 64, 64
     prediction = np.concatenate(predictions, axis=0)
     
     y_prob = prediction.reshape((h, w, d, len(labelmap)))
@@ -101,7 +107,6 @@ for ct_fn in tqdm(test_files[1:2]):
         img = y_prob[:,:,slice_i, 1:4]
         io.imshow(img)
         io.show()
-    y_pred[invalid_mask] = 0
-    imshow_labels(y_pred)
+
     imshow_labels(ct_labels.astype(int))
     
